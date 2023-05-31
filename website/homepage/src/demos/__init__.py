@@ -1,11 +1,8 @@
 import os
-import json
 
 GRADIO_DEMO_DIR = os.path.abspath(os.path.join(os.getcwd(), "..", "..", "demo"))
-# GRADIO_DEMO_DIR = os.path.join(GRADIO_DIR, "demo")
 DIR = os.path.dirname(__file__)
 TEMPLATE_FILE = os.path.join(DIR, "template.html")
-RECIPE_DEMOS = os.path.join(DIR, "recipe_demos.json")
 
 def get_code_and_description(demo_name):
     with open(os.path.join(GRADIO_DEMO_DIR, demo_name, "run.py")) as f:
@@ -62,9 +59,8 @@ demos_by_category = [
                 "dir": "animeganv2", 
             },
             {
-                "name": "Image Generation with Stable Diffusion", 
-                "dir": "stable-diffusion", 
-                "external_space": "stabilityai/stable-diffusion"
+                "name": "Image Generation (Fake GAN)", 
+                "dir": "fake_gan", 
             },
             {
                 "name": "Iterative Output",
@@ -79,6 +75,18 @@ demos_by_category = [
     {
         "category": "📈 Tabular Data & Plots",
         "demos": [
+            {
+                "name": "Interactive Dashboard",
+                "dir": "dashboard"
+            },
+            {
+                "name": "Dashboard with Live Updates",
+                "dir": "live_dashboard"
+            },
+            {
+                "name": "Interactive Map of AirBnB Locations",
+                "dir": "map_airbnb"
+            },
             {
                 "name": "Outbreak Forecast", 
                 "dir": "outbreak_forecast", 
@@ -134,14 +142,10 @@ for category in demos_by_category:
         demo["code"] = code
         demo["text"] = description
 
-with open(RECIPE_DEMOS, "w+") as j:
-    j.write(json.dumps(demos_by_category)) 
-
-
-def build(output_dir, jinja_env):
+def build(output_dir, jinja_env, latest_gradio_stable):
     os.makedirs(output_dir, exist_ok=True)
     template = jinja_env.get_template("demos/template.html")
-    output = template.render(demos_by_category=demos_by_category)
+    output = template.render(demos_by_category=demos_by_category, latest_gradio_stable=latest_gradio_stable)
     output_folder = os.path.join(output_dir, "demos")
     os.makedirs(output_folder)
     output_file = os.path.join(output_folder, "index.html")

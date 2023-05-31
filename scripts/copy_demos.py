@@ -1,13 +1,14 @@
-import shutil
+import argparse
 import os
 import pathlib
+import shutil
 import textwrap
-import argparse
 
 
 def copy_all_demos(source_dir: str, dest_dir: str):
     demos_to_copy = [
         "audio_debugger",
+        "altair_plot",
         "blocks_essay",
         "blocks_js_methods",
         "blocks_layout",
@@ -15,6 +16,9 @@ def copy_all_demos(source_dir: str, dest_dir: str):
         "blocks_multiple_event_triggers",
         "blocks_update",
         "calculator",
+        "cancel_events",
+        "chatbot_multimodal",
+        "code",
         "fake_gan",
         "fake_diffusion_with_gif",
         "gender_sentence_default_interpretation",
@@ -26,11 +30,13 @@ def copy_all_demos(source_dir: str, dest_dir: str):
         "kitchen_sink_random",
         "matrix_transpose",
         "model3D",
+        "native_plots",
         "reset_components",
         "reverse_audio",
         "stt_or_tts",
         "stream_audio",
         "stream_frames",
+        "video_component",
         "zip_files",
     ]
     for demo in demos_to_copy:
@@ -63,5 +69,7 @@ if __name__ == "__main__":
     opencv-python==4.6.0.66
     transformers==4.21.1
     torch==1.12.1
+    altair
+    vega_datasets
     """
     open(reqs_file_path, "w").write(textwrap.dedent(requirements))

@@ -1,159 +1,152 @@
 """This module should not be used directly as its API is subject to change. Instead,
-use the `gr.Blocks.load()` or `gr.Interface.load()` functions."""
+use the `gr.Blocks.load()` or `gr.load()` functions."""
 
 from __future__ import annotations
 
-import base64
 import json
-import math
-import numbers
-import operator
 import re
 import warnings
-from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Callable
 
 import requests
-import websockets
-import yaml
-from packaging import version
+from gradio_client import Client
+from gradio_client.documentation import document, set_documentation_group
 
 import gradio
-from gradio import components, exceptions, utils
-from gradio.processing_utils import to_binary
+from gradio import components, utils
+from gradio.context import Context
+from gradio.exceptions import Error, TooManyRequestsError
+from gradio.external_utils import (
+    cols_to_rows,
+    encode_to_base64,
+    get_tabular_examples,
+    postprocess_label,
+    rows_to_cols,
+    streamline_spaces_interface,
+)
+from gradio.processing_utils import extract_base64_data, to_binary
 
 if TYPE_CHECKING:
-    from gradio.components import DataframeData
+    from gradio.blocks import Blocks
+    from gradio.interface import Interface
 
 
-class TooManyRequestsError(Exception):
-    """Raised when the Hugging Face API returns a 429 status code."""
-
-    pass
+set_documentation_group("helpers")
 
 
-def load_blocks_from_repo(name, src=None, api_key=None, alias=None, **kwargs):
-    """Creates and returns a Blocks instance from several kinds of Hugging Face repos:
-    1) A model repo
-    2) A Spaces repo running Gradio 2.x
-    3) A Spaces repo running Gradio 3.x
+@document()
+def load(
+    name: str,
+    src: str | None = None,
+    api_key: str | None = None,
+    hf_token: str | None = None,
+    alias: str | None = None,
+    **kwargs,
+) -> Blocks:
     """
+    Method that constructs a Blocks from a Hugging Face repo. Can accept
+    model repos (if src is "models") or Space repos (if src is "spaces"). The input
+    and output components are automatically loaded from the repo.
+    Parameters:
+        name: the name of the model (e.g. "gpt2" or "facebook/bart-base") or space (e.g. "flax-community/spanish-gpt2"), can include the `src` as prefix (e.g. "models/facebook/bart-base")
+        src: the source of the model: `models` or `spaces` (or leave empty if source is provided as a prefix in `name`)
+        api_key: Deprecated. Please use the `hf_token` parameter instead.
+        hf_token: optional access token for loading private Hugging Face Hub models or spaces. Find your token here: https://huggingface.co/settings/tokens
+        alias: optional string used as the name of the loaded model instead of the default name (only applies if loading a Space running Gradio 2.x)
+    Returns:
+        a Gradio Blocks object for the given model
+    Example:
+        import gradio as gr
+        demo = gr.load("gradio/question-answering", src="spaces")
+        demo.launch()
+    """
+    if hf_token is None and api_key:
+        warnings.warn(
+            "The `api_key` parameter will be deprecated. Please use the `hf_token` parameter going forward."
+        )
+        hf_token = api_key
+    return load_blocks_from_repo(
+        name=name, src=src, api_key=hf_token, alias=alias, **kwargs
+    )
+
+
+def load_blocks_from_repo(
+    name: str,
+    src: str | None = None,
+    api_key: str | None = None,
+    alias: str | None = None,
+    **kwargs,
+) -> Blocks:
+    """Creates and returns a Blocks instance from a Hugging Face model or Space repo."""
     if src is None:
-        tokens = name.split(
-            "/"
-        )  # Separate the source (e.g. "huggingface") from the repo name (e.g. "google/vit-base-patch16-224")
+        # Separate the repo type (e.g. "model") from repo name (e.g. "google/vit-base-patch16-224")
+        tokens = name.split("/")
         assert (
             len(tokens) > 1
         ), "Either `src` parameter must be provided, or `name` must be formatted as {src}/{repo name}"
         src = tokens[0]
         name = "/".join(tokens[1:])
-    assert src.lower() in factory_methods, "parameter: src must be one of {}".format(
-        factory_methods.keys()
-    )
+
+    factory_methods: dict[str, Callable] = {
+        # for each repo type, we have a method that returns the Interface given the model name & optionally an api_key
+        "huggingface": from_model,
+        "models": from_model,
+        "spaces": from_spaces,
+    }
+    assert (
+        src.lower() in factory_methods
+    ), f"parameter: src must be one of {factory_methods.keys()}"
+
+    if api_key is not None:
+        if Context.hf_token is not None and Context.hf_token != api_key:
+            warnings.warn(
+                """You are loading a model/Space with a different access token than the one you used to load a previous model/Space. This is not recommended, as it may cause unexpected behavior."""
+            )
+        Context.hf_token = api_key
+
     blocks: gradio.Blocks = factory_methods[src](name, api_key, alias, **kwargs)
     return blocks
 
 
-def get_tabular_examples(model_name) -> Dict[str, List[float]]:
-    readme = requests.get(f"https://huggingface.co/{model_name}/resolve/main/README.md")
-    if readme.status_code != 200:
-        warnings.warn(f"Cannot load examples from README for {model_name}", UserWarning)
-        example_data = {}
-    else:
-        yaml_regex = re.search(
-            "(?:^|[\r\n])---[\n\r]+([\\S\\s]*?)[\n\r]+---([\n\r]|$)", readme.text
+def chatbot_preprocess(text, state):
+    payload = {
+        "inputs": {"generated_responses": None, "past_user_inputs": None, "text": text}
+    }
+    if state is not None:
+        payload["inputs"]["generated_responses"] = state["conversation"][
+            "generated_responses"
+        ]
+        payload["inputs"]["past_user_inputs"] = state["conversation"][
+            "past_user_inputs"
+        ]
+
+    return payload
+
+
+def chatbot_postprocess(response):
+    response_json = response.json()
+    chatbot_value = list(
+        zip(
+            response_json["conversation"]["past_user_inputs"],
+            response_json["conversation"]["generated_responses"],
         )
-        example_yaml = next(yaml.safe_load_all(readme.text[: yaml_regex.span()[-1]]))
-        example_data = example_yaml.get("widget", {}).get("structuredData", {})
-    if not example_data:
-        raise ValueError(
-            f"No example data found in README.md of {model_name} - Cannot build gradio demo. "
-            "See the README.md here: https://huggingface.co/scikit-learn/tabular-playground/blob/main/README.md "
-            "for a reference on how to provide example data to your model."
-        )
-    # replace nan with string NaN for inference API
-    for data in example_data.values():
-        for i, val in enumerate(data):
-            if isinstance(val, numbers.Number) and math.isnan(val):
-                data[i] = "NaN"
-    return example_data
+    )
+    return chatbot_value, response_json
 
 
-def cols_to_rows(
-    example_data: Dict[str, List[float]]
-) -> Tuple[List[str], List[List[float]]]:
-    headers = list(example_data.keys())
-    n_rows = max(len(example_data[header] or []) for header in headers)
-    data = []
-    for row_index in range(n_rows):
-        row_data = []
-        for header in headers:
-            col = example_data[header] or []
-            if row_index >= len(col):
-                row_data.append("NaN")
-            else:
-                row_data.append(col[row_index])
-        data.append(row_data)
-    return headers, data
+def from_model(model_name: str, api_key: str | None, alias: str | None, **kwargs):
+    model_url = f"https://huggingface.co/{model_name}"
+    api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+    print(f"Fetching model from: {model_url}")
 
-
-def rows_to_cols(
-    incoming_data: DataframeData,
-) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
-    data_column_wise = {}
-    for i, header in enumerate(incoming_data["headers"]):
-        data_column_wise[header] = [str(row[i]) for row in incoming_data["data"]]
-    return {"inputs": {"data": data_column_wise}}
-
-
-def get_models_interface(model_name, api_key, alias, **kwargs):
-    model_url = "https://huggingface.co/{}".format(model_name)
-    api_url = "https://api-inference.huggingface.co/models/{}".format(model_name)
-    print("Fetching model from: {}".format(model_url))
-
-    if api_key is not None:
-        headers = {"Authorization": f"Bearer {api_key}"}
-    else:
-        headers = {}
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key is not None else {}
 
     # Checking if model exists, and if so, it gets the pipeline
     response = requests.request("GET", api_url, headers=headers)
-    assert response.status_code == 200, "Invalid model name or src"
+    assert (
+        response.status_code == 200
+    ), f"Could not find model: {model_name}. If it is a private or gated model, please provide your Hugging Face access token (https://huggingface.co/settings/tokens) as the argument for the `api_key` parameter."
     p = response.json().get("pipeline_tag")
-
-    def postprocess_label(scores):
-        sorted_pred = sorted(scores.items(), key=operator.itemgetter(1), reverse=True)
-        return {
-            "label": sorted_pred[0][0],
-            "confidences": [
-                {"label": pred[0], "confidence": pred[1]} for pred in sorted_pred
-            ],
-        }
-
-    def encode_to_base64(r: requests.Response) -> str:
-        # Handles the different ways HF API returns the prediction
-        base64_repr = base64.b64encode(r.content).decode("utf-8")
-        data_prefix = ";base64,"
-        # Case 1: base64 representation already includes data prefix
-        if data_prefix in base64_repr:
-            return base64_repr
-        else:
-            content_type = r.headers.get("content-type")
-            # Case 2: the data prefix is a key in the response
-            if content_type == "application/json":
-                try:
-                    content_type = r.json()[0]["content-type"]
-                    base64_repr = r.json()[0]["blob"]
-                except KeyError:
-                    raise ValueError(
-                        "Cannot determine content type returned" "by external API."
-                    )
-            # Case 3: the data prefix is included in the response headers
-            else:
-                pass
-            new_base64 = "data:{};base64,".format(content_type) + base64_repr
-            return new_base64
-
     pipelines = {
         "audio-classification": {
             # example model: ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
@@ -165,18 +158,24 @@ def get_models_interface(model_name, api_key, alias, **kwargs):
             ),
         },
         "audio-to-audio": {
-            # example model: speechbrain/mtl-mimic-voicebank
+            # example model: facebook/xm_transformer_sm_all-en
             "inputs": components.Audio(source="upload", type="filepath", label="Input"),
             "outputs": components.Audio(label="Output"),
             "preprocess": to_binary,
             "postprocess": encode_to_base64,
         },
         "automatic-speech-recognition": {
-            # example model: jonatasgrosman/wav2vec2-large-xlsr-53-english
+            # example model: facebook/wav2vec2-base-960h
             "inputs": components.Audio(source="upload", type="filepath", label="Input"),
             "outputs": components.Textbox(label="Output"),
             "preprocess": to_binary,
             "postprocess": lambda r: r.json()["text"],
+        },
+        "conversational": {
+            "inputs": [components.Textbox(), components.State()],  # type: ignore
+            "outputs": [components.Chatbot(), components.State()],  # type: ignore
+            "preprocess": chatbot_preprocess,
+            "postprocess": chatbot_postprocess,
         },
         "feature-extraction": {
             # example model: julien-c/distilbert-feature-extraction
@@ -314,6 +313,47 @@ def get_models_interface(model_name, api_key, alias, **kwargs):
             "preprocess": lambda x: {"inputs": x},
             "postprocess": lambda r: r,  # Handled as a special case in query_huggingface_api()
         },
+        "document-question-answering": {
+            # example model: impira/layoutlm-document-qa
+            "inputs": [
+                components.Image(type="filepath", label="Input Document"),
+                components.Textbox(label="Question"),
+            ],
+            "outputs": components.Label(label="Label"),
+            "preprocess": lambda img, q: {
+                "inputs": {
+                    "image": extract_base64_data(img),  # Extract base64 data
+                    "question": q,
+                }
+            },
+            "postprocess": lambda r: postprocess_label(
+                {i["answer"]: i["score"] for i in r.json()}
+            ),
+        },
+        "visual-question-answering": {
+            # example model: dandelin/vilt-b32-finetuned-vqa
+            "inputs": [
+                components.Image(type="filepath", label="Input Image"),
+                components.Textbox(label="Question"),
+            ],
+            "outputs": components.Label(label="Label"),
+            "preprocess": lambda img, q: {
+                "inputs": {
+                    "image": extract_base64_data(img),
+                    "question": q,
+                }
+            },
+            "postprocess": lambda r: postprocess_label(
+                {i["answer"]: i["score"] for i in r.json()}
+            ),
+        },
+        "image-to-text": {
+            # example model: Salesforce/blip-image-captioning-base
+            "inputs": components.Image(type="filepath", label="Input Image"),
+            "outputs": components.Textbox(label="Generated Text"),
+            "preprocess": to_binary,
+            "postprocess": lambda r: r.json()[0]["generated_text"],
+        },
     }
 
     if p in ["tabular-classification", "tabular-regression"]:
@@ -339,8 +379,8 @@ def get_models_interface(model_name, api_key, alias, **kwargs):
             "examples": example_data,
         }
 
-    if p is None or not (p in pipelines):
-        raise ValueError("Unsupported pipeline type: {}".format(p))
+    if p is None or p not in pipelines:
+        raise ValueError(f"Unsupported pipeline type: {p}")
 
     pipeline = pipelines[p]
 
@@ -353,14 +393,14 @@ def get_models_interface(model_name, api_key, alias, **kwargs):
             data.update({"options": {"wait_for_model": True}})
             data = json.dumps(data)
         response = requests.request("POST", api_url, headers=headers, data=data)
-        if not (response.status_code == 200):
+        if response.status_code != 200:
             errors_json = response.json()
             errors, warns = "", ""
             if errors_json.get("error"):
                 errors = f", Error: {errors_json.get('error')}"
             if errors_json.get("warnings"):
                 warns = f", Warnings: {errors_json.get('warnings')}"
-            raise ValueError(
+            raise Error(
                 f"Could not complete request to HuggingFace API, Status Code: {response.status_code}"
                 + errors
                 + warns
@@ -388,156 +428,97 @@ def get_models_interface(model_name, api_key, alias, **kwargs):
     }
 
     kwargs = dict(interface_info, **kwargs)
-    kwargs["_api_mode"] = True  # So interface doesn't run pre/postprocess.
+
+    # So interface doesn't run pre/postprocess
+    # except for conversational interfaces which
+    # are stateful
+    kwargs["_api_mode"] = p != "conversational"
+
     interface = gradio.Interface(**kwargs)
     return interface
 
 
-def get_spaces(model_name, api_key, alias, **kwargs):
-    space_url = "https://huggingface.co/spaces/{}".format(model_name)
-    print("Fetching interface from: {}".format(space_url))
-    iframe_url = "https://hf.space/embed/{}/+".format(model_name)
+def from_spaces(
+    space_name: str, api_key: str | None, alias: str | None, **kwargs
+) -> Blocks:
+    space_url = f"https://huggingface.co/spaces/{space_name}"
 
-    r = requests.get(iframe_url)
+    print(f"Fetching Space from: {space_url}")
+
+    headers = {}
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    iframe_url = (
+        requests.get(
+            f"https://huggingface.co/api/spaces/{space_name}/host", headers=headers
+        )
+        .json()
+        .get("host")
+    )
+
+    if iframe_url is None:
+        raise ValueError(
+            f"Could not find Space: {space_name}. If it is a private or gated Space, please provide your Hugging Face access token (https://huggingface.co/settings/tokens) as the argument for the `api_key` parameter."
+        )
+
+    r = requests.get(iframe_url, headers=headers)
+
     result = re.search(
         r"window.gradio_config = (.*?);[\s]*</script>", r.text
     )  # some basic regex to extract the config
     try:
-        config = json.loads(result.group(1))
-    except AttributeError:
-        raise ValueError("Could not load the Space: {}".format(model_name))
+        config = json.loads(result.group(1))  # type: ignore
+    except AttributeError as ae:
+        raise ValueError(f"Could not load the Space: {space_name}") from ae
     if "allow_flagging" in config:  # Create an Interface for Gradio 2.x Spaces
-        return get_spaces_interface(model_name, config, alias, **kwargs)
+        return from_spaces_interface(
+            space_name, config, alias, api_key, iframe_url, **kwargs
+        )
     else:  # Create a Blocks for Gradio 3.x Spaces
-        return get_spaces_blocks(model_name, config)
-
-
-async def get_pred_from_ws(
-    websocket: websockets.WebSocketClientProtocol, data: str
-) -> Dict[str, Any]:
-    completed = False
-    while not completed:
-        msg = await websocket.recv()
-        resp = json.loads(msg)
-        if resp["msg"] == "queue_full":
-            raise exceptions.Error("Queue is full! Please try again.")
-        elif resp["msg"] == "send_data":
-            await websocket.send(data)
-        completed = resp["msg"] == "process_completed"
-    return resp["output"]
-
-
-def get_ws_fn(ws_url):
-    async def ws_fn(data):
-        async with websockets.connect(ws_url, open_timeout=10) as websocket:
-            return await get_pred_from_ws(websocket, data)
-
-    return ws_fn
-
-
-def use_websocket(config, dependency):
-    queue_enabled = config.get("enable_queue", False)
-    queue_uses_websocket = version.parse(
-        config.get("version", "2.0")
-    ) >= version.Version("3.2")
-    dependency_uses_queue = dependency.get("queue", False) is not False
-    return queue_enabled and queue_uses_websocket and dependency_uses_queue
-
-
-def get_spaces_blocks(model_name, config):
-    def streamline_config(config: dict) -> dict:
-        """Streamlines the blocks config dictionary to fix components that don't render correctly."""
-        # TODO(abidlabs): Need a better way to fix relative paths in dataset component
-        for c, component in enumerate(config["components"]):
-            if component["type"] == "dataset":
-                config["components"][c]["props"]["visible"] = False
-        return config
-
-    config = streamline_config(config)
-    api_url = "https://hf.space/embed/{}/api/predict/".format(model_name)
-    headers = {"Content-Type": "application/json"}
-    ws_url = "wss://spaces.huggingface.tech/{}/queue/join".format(model_name)
-
-    ws_fn = get_ws_fn(ws_url)
-
-    fns = []
-    for d, dependency in enumerate(config["dependencies"]):
-        if dependency["backend_fn"]:
-
-            def get_fn(outputs, fn_index, use_ws):
-                def fn(*data):
-                    data = json.dumps({"data": data, "fn_index": fn_index})
-                    if use_ws:
-                        result = utils.synchronize_async(ws_fn, data)
-                        output = result["data"]
-                    else:
-                        response = requests.post(api_url, headers=headers, data=data)
-                        result = json.loads(response.content.decode("utf-8"))
-                        try:
-                            output = result["data"]
-                        except KeyError:
-                            if "error" in result and "429" in result["error"]:
-                                raise TooManyRequestsError(
-                                    "Too many requests to the Hugging Face API"
-                                )
-                            raise KeyError(
-                                f"Could not find 'data' key in response from external Space. Response received: {result}"
-                            )
-                    if len(outputs) == 1:
-                        output = output[0]
-                    return output
-
-                return fn
-
-            fn = get_fn(
-                deepcopy(dependency["outputs"]), d, use_websocket(config, dependency)
+        if kwargs:
+            warnings.warn(
+                "You cannot override parameters for this Space by passing in kwargs. "
+                "Instead, please load the Space as a function and use it to create a "
+                "Blocks or Interface locally. You may find this Guide helpful: "
+                "https://gradio.app/using_blocks_like_functions/"
             )
-            fns.append(fn)
-        else:
-            fns.append(None)
-    return gradio.Blocks.from_config(config, fns)
+        return from_spaces_blocks(space=space_name, api_key=api_key)
 
 
-def get_spaces_interface(model_name, config, alias, **kwargs):
-    def streamline_config(config: dict) -> dict:
-        """Streamlines the interface config dictionary to remove unnecessary keys."""
-        config["inputs"] = [
-            components.get_component_instance(component)
-            for component in config["input_components"]
-        ]
-        config["outputs"] = [
-            components.get_component_instance(component)
-            for component in config["output_components"]
-        ]
-        parameters = {
-            "article",
-            "description",
-            "flagging_options",
-            "inputs",
-            "outputs",
-            "theme",
-            "title",
-        }
-        config = {k: config[k] for k in parameters}
-        return config
+def from_spaces_blocks(space: str, api_key: str | None) -> Blocks:
+    client = Client(space, hf_token=api_key)
+    predict_fns = [endpoint._predict_resolve for endpoint in client.endpoints]
+    return gradio.Blocks.from_config(client.config, predict_fns, client.src)
 
-    config = streamline_config(config)
-    api_url = "https://hf.space/embed/{}/api/predict/".format(model_name)
+
+def from_spaces_interface(
+    model_name: str,
+    config: dict,
+    alias: str | None,
+    api_key: str | None,
+    iframe_url: str,
+    **kwargs,
+) -> Interface:
+    config = streamline_spaces_interface(config)
+    api_url = f"{iframe_url}/api/predict/"
     headers = {"Content-Type": "application/json"}
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     # The function should call the API with preprocessed data
     def fn(*data):
         data = json.dumps({"data": data})
         response = requests.post(api_url, headers=headers, data=data)
         result = json.loads(response.content.decode("utf-8"))
+        if "error" in result and "429" in result["error"]:
+            raise TooManyRequestsError("Too many requests to the Hugging Face API")
         try:
             output = result["data"]
-        except KeyError:
-            if "error" in result and "429" in result["error"]:
-                raise TooManyRequestsError("Too many requests to the Hugging Face API")
+        except KeyError as ke:
             raise KeyError(
                 f"Could not find 'data' key in response from external Space. Response received: {result}"
-            )
+            ) from ke
         if (
             len(config["outputs"]) == 1
         ):  # if the fn is supposed to return a single value, pop it
@@ -555,189 +536,3 @@ def get_spaces_interface(model_name, config, alias, **kwargs):
     kwargs["_api_mode"] = True
     interface = gradio.Interface(**kwargs)
     return interface
-
-
-factory_methods: Dict[str, Callable] = {
-    # for each repo type, we have a method that returns the Interface given the model name & optionally an api_key
-    "huggingface": get_models_interface,
-    "models": get_models_interface,
-    "spaces": get_spaces,
-}
-
-
-def load_from_pipeline(pipeline):
-    """
-    Gets the appropriate Interface kwargs for a given Hugging Face transformers.Pipeline.
-    pipeline (transformers.Pipeline): the transformers.Pipeline from which to create an interface
-    Returns:
-    (dict): a dictionary of kwargs that can be used to construct an Interface object
-    """
-    try:
-        import transformers
-    except ImportError:
-        raise ImportError(
-            "transformers not installed. Please try `pip install transformers`"
-        )
-    if not isinstance(pipeline, transformers.Pipeline):
-        raise ValueError("pipeline must be a transformers.Pipeline")
-
-    # Handle the different pipelines. The has_attr() checks to make sure the pipeline exists in the
-    # version of the transformers library that the user has installed.
-    if hasattr(transformers, "AudioClassificationPipeline") and isinstance(
-        pipeline, transformers.AudioClassificationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Audio(
-                source="microphone", type="filepath", label="Input"
-            ),
-            "outputs": components.Label(label="Class"),
-            "preprocess": lambda i: {"inputs": i},
-            "postprocess": lambda r: {i["label"].split(", ")[0]: i["score"] for i in r},
-        }
-    elif hasattr(transformers, "AutomaticSpeechRecognitionPipeline") and isinstance(
-        pipeline, transformers.AutomaticSpeechRecognitionPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Audio(
-                source="microphone", type="filepath", label="Input"
-            ),
-            "outputs": components.Textbox(label="Output"),
-            "preprocess": lambda i: {"inputs": i},
-            "postprocess": lambda r: r["text"],
-        }
-    elif hasattr(transformers, "FeatureExtractionPipeline") and isinstance(
-        pipeline, transformers.FeatureExtractionPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Dataframe(label="Output"),
-            "preprocess": lambda x: {"inputs": x},
-            "postprocess": lambda r: r[0],
-        }
-    elif hasattr(transformers, "FillMaskPipeline") and isinstance(
-        pipeline, transformers.FillMaskPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Label(label="Classification"),
-            "preprocess": lambda x: {"inputs": x},
-            "postprocess": lambda r: {i["token_str"]: i["score"] for i in r},
-        }
-    elif hasattr(transformers, "ImageClassificationPipeline") and isinstance(
-        pipeline, transformers.ImageClassificationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Image(type="filepath", label="Input Image"),
-            "outputs": components.Label(type="confidences", label="Classification"),
-            "preprocess": lambda i: {"images": i},
-            "postprocess": lambda r: {i["label"].split(", ")[0]: i["score"] for i in r},
-        }
-    elif hasattr(transformers, "QuestionAnsweringPipeline") and isinstance(
-        pipeline, transformers.QuestionAnsweringPipeline
-    ):
-        pipeline_info = {
-            "inputs": [
-                components.Textbox(lines=7, label="Context"),
-                components.Textbox(label="Question"),
-            ],
-            "outputs": [
-                components.Textbox(label="Answer"),
-                components.Label(label="Score"),
-            ],
-            "preprocess": lambda c, q: {"context": c, "question": q},
-            "postprocess": lambda r: (r["answer"], r["score"]),
-        }
-    elif hasattr(transformers, "SummarizationPipeline") and isinstance(
-        pipeline, transformers.SummarizationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(lines=7, label="Input"),
-            "outputs": components.Textbox(label="Summary"),
-            "preprocess": lambda x: {"inputs": x},
-            "postprocess": lambda r: r[0]["summary_text"],
-        }
-    elif hasattr(transformers, "TextClassificationPipeline") and isinstance(
-        pipeline, transformers.TextClassificationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Label(label="Classification"),
-            "preprocess": lambda x: [x],
-            "postprocess": lambda r: {i["label"].split(", ")[0]: i["score"] for i in r},
-        }
-    elif hasattr(transformers, "TextGenerationPipeline") and isinstance(
-        pipeline, transformers.TextGenerationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Textbox(label="Output"),
-            "preprocess": lambda x: {"text_inputs": x},
-            "postprocess": lambda r: r[0]["generated_text"],
-        }
-    elif hasattr(transformers, "TranslationPipeline") and isinstance(
-        pipeline, transformers.TranslationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Textbox(label="Translation"),
-            "preprocess": lambda x: [x],
-            "postprocess": lambda r: r[0]["translation_text"],
-        }
-    elif hasattr(transformers, "Text2TextGenerationPipeline") and isinstance(
-        pipeline, transformers.Text2TextGenerationPipeline
-    ):
-        pipeline_info = {
-            "inputs": components.Textbox(label="Input"),
-            "outputs": components.Textbox(label="Generated Text"),
-            "preprocess": lambda x: [x],
-            "postprocess": lambda r: r[0]["generated_text"],
-        }
-    elif hasattr(transformers, "ZeroShotClassificationPipeline") and isinstance(
-        pipeline, transformers.ZeroShotClassificationPipeline
-    ):
-        pipeline_info = {
-            "inputs": [
-                components.Textbox(label="Input"),
-                components.Textbox(label="Possible class names (" "comma-separated)"),
-                components.Checkbox(label="Allow multiple true classes"),
-            ],
-            "outputs": components.Label(label="Classification"),
-            "preprocess": lambda i, c, m: {
-                "sequences": i,
-                "candidate_labels": c,
-                "multi_label": m,
-            },
-            "postprocess": lambda r: {
-                r["labels"][i]: r["scores"][i] for i in range(len(r["labels"]))
-            },
-        }
-    else:
-        raise ValueError("Unsupported pipeline type: {}".format(type(pipeline)))
-
-    # define the function that will be called by the Interface
-    def fn(*params):
-        data = pipeline_info["preprocess"](*params)
-        # special cases that needs to be handled differently
-        if isinstance(
-            pipeline,
-            (
-                transformers.TextClassificationPipeline,
-                transformers.Text2TextGenerationPipeline,
-                transformers.TranslationPipeline,
-            ),
-        ):
-            data = pipeline(*data)
-        else:
-            data = pipeline(**data)
-        output = pipeline_info["postprocess"](data)
-        return output
-
-    interface_info = pipeline_info.copy()
-    interface_info["fn"] = fn
-    del interface_info["preprocess"]
-    del interface_info["postprocess"]
-
-    # define the title/description of the Interface
-    interface_info["title"] = pipeline.model.__class__.__name__
-
-    return interface_info

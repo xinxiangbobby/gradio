@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+from gradio_client.documentation import document, set_documentation_group
 
 from gradio.blocks import BlockContext
-from gradio.documentation import document, set_documentation_group
+from gradio.events import Changeable, Selectable
 
 set_documentation_group("layout")
-
-if TYPE_CHECKING:  # Only import for type checking (is False at runtime).
-    from gradio.components import Component
 
 
 @document()
@@ -17,12 +15,12 @@ class Row(BlockContext):
     """
     Row is a layout element within Blocks that renders all children horizontally.
     Example:
-        with gradio.Blocks() as demo:
-            with gradio.Row():
+        with gr.Blocks() as demo:
+            with gr.Row():
                 gr.Image("lion.jpg")
                 gr.Image("tiger.jpg")
         demo.launch()
-    Guides: controlling_layout
+    Guides: controlling-layout
     """
 
     def __init__(
@@ -30,7 +28,7 @@ class Row(BlockContext):
         *,
         variant: str = "default",
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -49,7 +47,7 @@ class Row(BlockContext):
 
     @staticmethod
     def update(
-        visible: Optional[bool] = None,
+        visible: bool | None = None,
     ):
         return {
             "visible": visible,
@@ -59,8 +57,8 @@ class Row(BlockContext):
     def style(
         self,
         *,
-        equal_height: Optional[bool] = None,
-        mobile_collapse: Optional[bool] = None,
+        equal_height: bool | None = None,
+        mobile_collapse: bool | None = None,
         **kwargs,
     ):
         """
@@ -82,15 +80,15 @@ class Column(BlockContext):
     Column is a layout element within Blocks that renders all children vertically. The widths of columns can be set through the `scale` and `min_width` parameters.
     If a certain scale results in a column narrower than min_width, the min_width parameter will win.
     Example:
-        with gradio.Blocks() as demo:
-            with gradio.Row():
-                with gradio.Column(scale=1):
+        with gr.Blocks() as demo:
+            with gr.Row():
+                with gr.Column(scale=1):
                     text1 = gr.Textbox()
                     text2 = gr.Textbox()
-                with gradio.Column(scale=4):
+                with gr.Column(scale=4):
                     btn1 = gr.Button("Button 1")
                     btn2 = gr.Button("Button 2")
-    Guides: controlling_layout
+    Guides: controlling-layout
     """
 
     def __init__(
@@ -100,7 +98,7 @@ class Column(BlockContext):
         min_width: int = 320,
         variant: str = "default",
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -129,8 +127,8 @@ class Column(BlockContext):
 
     @staticmethod
     def update(
-        variant: Optional[str] = None,
-        visible: Optional[bool] = None,
+        variant: str | None = None,
+        visible: bool | None = None,
     ):
         return {
             "variant": variant,
@@ -139,7 +137,7 @@ class Column(BlockContext):
         }
 
 
-class Tabs(BlockContext):
+class Tabs(BlockContext, Changeable, Selectable):
     """
     Tabs is a layout element within Blocks that can contain multiple "Tab" Components.
     """
@@ -147,9 +145,9 @@ class Tabs(BlockContext):
     def __init__(
         self,
         *,
-        selected: Optional[int | str] = None,
+        selected: int | str | None = None,
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -158,40 +156,45 @@ class Tabs(BlockContext):
             visible: If False, Tabs will be hidden.
             elem_id: An optional string that is assigned as the id of this component in the HTML DOM. Can be used for targeting CSS styles.
         """
-        super().__init__(visible=visible, elem_id=elem_id, **kwargs)
+        BlockContext.__init__(self, visible=visible, elem_id=elem_id, **kwargs)
+        Changeable.__init__(self)
+        Selectable.__init__(self)
         self.selected = selected
 
     def get_config(self):
-        return {"selected": self.selected, **super().get_config()}
+        return {"selected": self.selected, **super(BlockContext, self).get_config()}
 
+    @staticmethod
     def update(
-        selected: Optional[int | str] = None,
+        selected: int | str | None = None,
     ):
         return {
             "selected": selected,
             "__type__": "update",
         }
 
-    def change(self, fn: Callable, inputs: List[Component], outputs: List[Component]):
-        """
-        Parameters:
-            fn: Callable function
-            inputs: List of inputs
-            outputs: List of outputs
-        Returns: None
-        """
-        self.set_event_trigger("change", fn, inputs, outputs)
 
-
-class TabItem(BlockContext):
-    expected_parent = Tabs
+@document()
+class Tab(BlockContext, Selectable):
+    """
+    Tab (or its alias TabItem) is a layout element. Components defined within the Tab will be visible when this tab is selected tab.
+    Example:
+        with gr.Blocks() as demo:
+            with gr.Tab("Lion"):
+                gr.Image("lion.jpg")
+                gr.Button("New Lion")
+            with gr.Tab("Tiger"):
+                gr.Image("tiger.jpg")
+                gr.Button("New Tiger")
+    Guides: controlling-layout
+    """
 
     def __init__(
         self,
         label: str,
         *,
-        id: Optional[int | str] = None,
-        elem_id: Optional[str] = None,
+        id: int | str | None = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -200,7 +203,8 @@ class TabItem(BlockContext):
             id: An optional identifier for the tab, required if you wish to control the selected tab from a predict function.
             elem_id: An optional string that is assigned as the id of this component in the HTML DOM. Can be used for targeting CSS styles.
         """
-        super().__init__(elem_id=elem_id, **kwargs)
+        BlockContext.__init__(self, elem_id=elem_id, **kwargs)
+        Selectable.__init__(self)
         self.label = label
         self.id = id
 
@@ -208,39 +212,17 @@ class TabItem(BlockContext):
         return {
             "label": self.label,
             "id": self.id,
-            **super().get_config(),
+            **super(BlockContext, self).get_config(),
         }
 
-    def select(self, fn: Callable, inputs: List[Component], outputs: List[Component]):
-        """
-        Parameters:
-            fn: Callable function
-            inputs: List of inputs
-            outputs: List of outputs
-        Returns: None
-        """
-        self.set_event_trigger("select", fn, inputs, outputs)
+    def get_expected_parent(self) -> type[Tabs]:
+        return Tabs
+
+    def get_block_name(self):
+        return "tabitem"
 
 
-@document()
-class Tab(TabItem):
-    """
-    Tab is a layout element. Components defined within the Tab will be visible when this tab is selected tab.
-    Example:
-        with gradio.Blocks() as demo:
-            with gradio.Tab("Lion"):
-                gr.Image("lion.jpg")
-                gr.Button("New Lion")
-            with gradio.Tab("Tiger"):
-                gr.Image("tiger.jpg")
-                gr.Button("New Tiger")
-    Guides: controlling_layout
-    """
-
-    pass
-
-
-Tab = TabItem  # noqa: F811
+TabItem = Tab
 
 
 class Group(BlockContext):
@@ -248,7 +230,7 @@ class Group(BlockContext):
     Group is a layout element within Blocks which groups together children so that
     they do not have any padding or margin between them.
     Example:
-        with gradio.Group():
+        with gr.Group():
             gr.Textbox(label="First")
             gr.Textbox(label="Last")
     """
@@ -257,7 +239,7 @@ class Group(BlockContext):
         self,
         *,
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -272,7 +254,7 @@ class Group(BlockContext):
 
     @staticmethod
     def update(
-        visible: Optional[bool] = None,
+        visible: bool | None = None,
     ):
         return {
             "visible": visible,
@@ -286,7 +268,7 @@ class Box(BlockContext):
     Box is a a layout element which places children in a box with rounded corners and
     some padding around them.
     Example:
-        with gradio.Box():
+        with gr.Box():
             gr.Textbox(label="First")
             gr.Textbox(label="Last")
     """
@@ -295,7 +277,7 @@ class Box(BlockContext):
         self,
         *,
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -310,7 +292,7 @@ class Box(BlockContext):
 
     @staticmethod
     def update(
-        visible: Optional[bool] = None,
+        visible: bool | None = None,
     ):
         return {
             "visible": visible,
@@ -331,7 +313,7 @@ class Accordion(BlockContext):
     """
     Accordion is a layout element which can be toggled to show/hide the contained content.
     Example:
-        with gradio.Accordion("See Details"):
+        with gr.Accordion("See Details"):
             gr.Markdown("lorem ipsum")
     """
 
@@ -341,7 +323,7 @@ class Accordion(BlockContext):
         *,
         open: bool = True,
         visible: bool = True,
-        elem_id: Optional[str] = None,
+        elem_id: str | None = None,
         **kwargs,
     ):
         """
@@ -364,11 +346,13 @@ class Accordion(BlockContext):
 
     @staticmethod
     def update(
-        open: Optional[bool] = None,
-        visible: Optional[bool] = None,
+        open: bool | None = None,
+        label: str | None = None,
+        visible: bool | None = None,
     ):
         return {
             "visible": visible,
+            "label": label,
             "open": open,
             "__type__": "update",
         }

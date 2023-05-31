@@ -67,6 +67,10 @@
 .prose > p > img {
   @apply max-w-full mx-auto my-0 w-4/5;
 }
+.prose > p > video {
+  @apply max-w-full mx-auto my-0 w-4/5;
+}
+
 .prose code::before {
   display: none;
 }
@@ -88,6 +92,10 @@
 .thinner-link.current-nav-link {
   @apply border-orange-500 text-orange-500;
 }
+.prose :where(img):not(:where([class~=not-prose] *)) {
+  margin-bottom: 0;
+  margin-top: 0;
+}
 
 /* docs */
 .selected-demo {
@@ -96,11 +104,21 @@
 code.language-python {
   @apply !leading-7 !whitespace-pre-wrap !break-all;
 }
+code.language-bash {
+  @apply !leading-7 !whitespace-pre-wrap !break-all;
+}
+
 .group-hover-visible {
   @apply group-hover:visible;
 }
 .anchor-img {
   @apply w-7 max-w-full inline-block m-0 ml-2;
+}
+.selected-version {
+  @apply font-semibold text-orange-500;
+}
+.selected-version:before {
+  content:"• ";
 }
 
 /* copy button */
@@ -142,5 +160,4 @@ code.language-python {
 .selected-demo-window {
   @apply rounded-b-md border-2  border-gray-100 -mt-0.5;
 }
-
 

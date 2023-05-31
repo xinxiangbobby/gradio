@@ -2,22 +2,18 @@ from __future__ import annotations
 
 import base64
 import json
-import mimetypes
 import os
-import pathlib
 import shutil
 import subprocess
 import tempfile
 import warnings
 from io import BytesIO
-from typing import Dict
+from pathlib import Path
 
 import numpy as np
-import requests
 from ffmpy import FFmpeg, FFprobe, FFRuntimeError
+from gradio_client import utils as client_utils
 from PIL import Image, ImageOps, PngImagePlugin
-
-from gradio import encryptor, utils
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")  # Ignore pydub warning if ffmpeg is not installed
@@ -29,11 +25,21 @@ with warnings.catch_warnings():
 #########################
 
 
-def to_binary(x: str | Dict) -> bytes:
+def to_binary(x: str | dict) -> bytes:
     """Converts a base64 string or dictionary to a binary string that can be sent in a POST."""
     if isinstance(x, dict):
-        x = encode_url_or_file_to_base64(x["name"])
-    return base64.b64decode(x.split(",")[1])
+        if x.get("data"):
+            base64str = x["data"]
+        else:
+            base64str = client_utils.encode_url_or_file_to_base64(x["name"])
+    else:
+        base64str = x
+    return base64.b64decode(extract_base64_data(base64str))
+
+
+def extract_base64_data(x: str) -> str:
+    """Just extracts the base64 data from a general base64 string."""
+    return x.rsplit(",", 1)[-1]
 
 
 #########################
@@ -41,61 +47,14 @@ def to_binary(x: str | Dict) -> bytes:
 #########################
 
 
-def decode_base64_to_image(encoding):
-    content = encoding.split(";")[1]
-    image_encoded = content.split(",")[1]
-    return Image.open(BytesIO(base64.b64decode(image_encoded)))
-
-
-def encode_url_or_file_to_base64(path, encryption_key=None):
-    if utils.validate_url(path):
-        return encode_url_to_base64(path, encryption_key=encryption_key)
-    else:
-        return encode_file_to_base64(path, encryption_key=encryption_key)
-
-
-def get_mimetype(filename):
-    mimetype = mimetypes.guess_type(filename)[0]
-    if mimetype is not None:
-        mimetype = mimetype.replace("x-wav", "wav").replace("x-flac", "flac")
-    return mimetype
-
-
-def get_extension(encoding):
-    encoding = encoding.replace("audio/wav", "audio/x-wav")
-    type = mimetypes.guess_type(encoding)[0]
-    if type == "audio/flac":  # flac is not supported by mimetypes
-        return "flac"
-    extension = mimetypes.guess_extension(type)
-    if extension is not None and extension.startswith("."):
-        extension = extension[1:]
-    return extension
-
-
-def encode_file_to_base64(f, encryption_key=None):
-    with open(f, "rb") as file:
-        encoded_string = base64.b64encode(file.read())
-        if encryption_key:
-            encoded_string = encryptor.decrypt(encryption_key, encoded_string)
-        base64_str = str(encoded_string, "utf-8")
-        mimetype = get_mimetype(f)
-        return (
-            "data:"
-            + (mimetype if mimetype is not None else "")
-            + ";base64,"
-            + base64_str
-        )
-
-
-def encode_url_to_base64(url, encryption_key=None):
-    encoded_string = base64.b64encode(requests.get(url).content)
-    if encryption_key:
-        encoded_string = encryptor.decrypt(encryption_key, encoded_string)
-    base64_str = str(encoded_string, "utf-8")
-    mimetype = get_mimetype(url)
-    return (
-        "data:" + (mimetype if mimetype is not None else "") + ";base64," + base64_str
-    )
+def decode_base64_to_image(encoding: str) -> Image.Image:
+    image_encoded = extract_base64_data(encoding)
+    img = Image.open(BytesIO(base64.b64decode(image_encoded)))
+    exif = img.getexif()
+    # 274 is the code for image rotation and 1 means "correct orientation"
+    if exif.get(274, 1) != 1 and hasattr(ImageOps, "exif_transpose"):
+        img = ImageOps.exif_transpose(img)
+    return img
 
 
 def encode_plot_to_base64(plt):
@@ -106,43 +65,24 @@ def encode_plot_to_base64(plt):
     return "data:image/png;base64," + base64_str
 
 
-def download_to_file(url, dir=None):
-    file_suffix = os.path.splitext(url)[1]
-    file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, dir=dir)
-    with requests.get(url, stream=True) as r:
-        with open(file_obj.name, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-    return file_obj
+def get_pil_metadata(pil_image):
+    # Copy any text-only metadata
+    metadata = PngImagePlugin.PngInfo()
+    for key, value in pil_image.info.items():
+        if isinstance(key, str) and isinstance(value, str):
+            metadata.add_text(key, value)
+
+    return metadata
 
 
-def save_array_to_file(image_array, dir=None):
-    pil_image = Image.fromarray(_convert(image_array, np.uint8, force_copy=False))
-    file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=dir)
-    pil_image.save(file_obj)
-    return file_obj
-
-
-def save_pil_to_file(pil_image, dir=None):
-    file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=dir)
-    pil_image.save(file_obj)
-    return file_obj
+def encode_pil_to_bytes(pil_image, format="png"):
+    with BytesIO() as output_bytes:
+        pil_image.save(output_bytes, format, pnginfo=get_pil_metadata(pil_image))
+        return output_bytes.getvalue()
 
 
 def encode_pil_to_base64(pil_image):
-    with BytesIO() as output_bytes:
-
-        # Copy any text-only metadata
-        use_metadata = False
-        metadata = PngImagePlugin.PngInfo()
-        for key, value in pil_image.info.items():
-            if isinstance(key, str) and isinstance(value, str):
-                metadata.add_text(key, value)
-                use_metadata = True
-
-        pil_image.save(
-            output_bytes, "PNG", pnginfo=(metadata if use_metadata else None)
-        )
-        bytes_data = output_bytes.getvalue()
+    bytes_data = encode_pil_to_bytes(pil_image)
     base64_str = str(base64.b64encode(bytes_data), "utf-8")
     return "data:image/png;base64," + base64_str
 
@@ -180,7 +120,7 @@ def resize_and_crop(img, size, crop_type="center"):
         resize[0] = img.size[0]
     if size[1] is None:
         resize[1] = img.size[1]
-    return ImageOps.fit(img, resize, centering=center)
+    return ImageOps.fit(img, resize, centering=center)  # type: ignore
 
 
 ##################
@@ -192,11 +132,15 @@ def audio_from_file(filename, crop_min=0, crop_max=100):
     try:
         audio = AudioSegment.from_file(filename)
     except FileNotFoundError as e:
-        error_message = str(e)
-        if "ffprobe" in error_message:
-            print(
-                "Please install `ffmpeg` in your system to use non-WAV audio file formats."
-            )
+        isfile = Path(filename).is_file()
+        msg = (
+            f"Cannot load audio from file: `{'ffprobe' if isfile else filename}` not found."
+            + " Please install `ffmpeg` in your system to use non-WAV audio file formats"
+            " and make sure `ffprobe` is in your PATH."
+            if isfile
+            else ""
+        )
+        raise RuntimeError(msg) from e
     if crop_min != 0 or crop_max != 100:
         audio_start = len(audio) * crop_min / 100
         audio_end = len(audio) * crop_max / 100
@@ -207,139 +151,52 @@ def audio_from_file(filename, crop_min=0, crop_max=100):
     return audio.frame_rate, data
 
 
-def audio_to_file(sample_rate, data, filename):
-    data = convert_to_16_bit_wav(data)
+def audio_to_file(sample_rate, data, filename, format="wav"):
+    if format == "wav":
+        data = convert_to_16_bit_wav(data)
     audio = AudioSegment(
         data.tobytes(),
         frame_rate=sample_rate,
         sample_width=data.dtype.itemsize,
         channels=(1 if len(data.shape) == 1 else data.shape[1]),
     )
-    audio.export(filename, format="wav").close()
+    file = audio.export(filename, format=format)
+    file.close()  # type: ignore
 
 
 def convert_to_16_bit_wav(data):
     # Based on: https://docs.scipy.org/doc/scipy/reference/generated/scipy.io.wavfile.write.html
-    if data.dtype == np.float32:
-        warnings.warn(
-            "Audio data is not in 16-bit integer format."
-            "Trying to convert to 16-bit int format."
-        )
+    warning = "Trying to convert audio automatically from {} to 16-bit int format."
+    if data.dtype in [np.float64, np.float32, np.float16]:
+        warnings.warn(warning.format(data.dtype))
         data = data / np.abs(data).max()
         data = data * 32767
         data = data.astype(np.int16)
     elif data.dtype == np.int32:
-        warnings.warn(
-            "Audio data is not in 16-bit integer format."
-            "Trying to convert to 16-bit int format."
-        )
+        warnings.warn(warning.format(data.dtype))
         data = data / 65538
         data = data.astype(np.int16)
     elif data.dtype == np.int16:
         pass
+    elif data.dtype == np.uint16:
+        warnings.warn(warning.format(data.dtype))
+        data = data - 32768
+        data = data.astype(np.int16)
     elif data.dtype == np.uint8:
-        warnings.warn(
-            "Audio data is not in 16-bit integer format."
-            "Trying to convert to 16-bit int format."
-        )
+        warnings.warn(warning.format(data.dtype))
         data = data * 257 - 32768
         data = data.astype(np.int16)
     else:
-        raise ValueError("Audio data cannot be converted to " "16-bit int format.")
+        raise ValueError(
+            "Audio data cannot be converted automatically from "
+            f"{data.dtype} to 16-bit int format."
+        )
     return data
 
 
 ##################
 # OUTPUT
 ##################
-
-
-def decode_base64_to_binary(encoding):
-    extension = get_extension(encoding)
-    data = encoding.split(",")[1]
-    return base64.b64decode(data), extension
-
-
-def decode_base64_to_file(
-    encoding, encryption_key=None, file_path=None, dir=None, prefix=None
-):
-    if dir is not None:
-        os.makedirs(dir, exist_ok=True)
-    data, extension = decode_base64_to_binary(encoding)
-    if file_path is not None and prefix is None:
-        filename = os.path.basename(file_path)
-        prefix = filename
-        if "." in filename:
-            prefix = filename[0 : filename.index(".")]
-            extension = filename[filename.index(".") + 1 :]
-    if extension is None:
-        file_obj = tempfile.NamedTemporaryFile(delete=False, prefix=prefix, dir=dir)
-    else:
-        file_obj = tempfile.NamedTemporaryFile(
-            delete=False,
-            prefix=prefix,
-            suffix="." + extension,
-            dir=dir,
-        )
-    if encryption_key is not None:
-        data = encryptor.encrypt(encryption_key, data)
-    file_obj.write(data)
-    file_obj.flush()
-    return file_obj
-
-
-def create_tmp_copy_of_file_or_url(file_path_or_url: str, dir=None):
-    try:
-        response = requests.get(file_path_or_url, stream=True)
-        if file_path_or_url.find("/"):
-            new_file_path = file_path_or_url.rsplit("/", 1)[1]
-        else:
-            new_file_path = "file.txt"
-        with open(new_file_path, "wb") as out_file:
-            shutil.copyfileobj(response.raw, out_file)
-        del response
-    except (requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema):
-        return create_tmp_copy_of_file(file_path_or_url, dir)
-
-
-def dict_or_str_to_json_file(jsn, dir=None):
-    if dir is not None:
-        os.makedirs(dir, exist_ok=True)
-
-    file_obj = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".json", dir=dir, mode="w+"
-    )
-    if isinstance(jsn, str):
-        jsn = json.loads(jsn)
-    json.dump(jsn, file_obj)
-    file_obj.flush()
-    return file_obj
-
-
-def file_to_json(file_path):
-    return json.load(open(file_path))
-
-
-def create_tmp_copy_of_file(file_path, dir=None):
-    if dir is not None:
-        os.makedirs(dir, exist_ok=True)
-
-    file_name = os.path.basename(file_path)
-    prefix, extension = file_name, None
-    if "." in file_name:
-        prefix = file_name[0 : file_name.index(".")]
-        extension = file_name[file_name.index(".") + 1 :]
-    if extension is None:
-        file_obj = tempfile.NamedTemporaryFile(delete=False, prefix=prefix, dir=dir)
-    else:
-        file_obj = tempfile.NamedTemporaryFile(
-            delete=False,
-            prefix=prefix,
-            suffix="." + extension,
-            dir=dir,
-        )
-    shutil.copy2(file_path, file_obj.name)
-    return file_obj
 
 
 def _convert(image, dtype, force_copy=False, uniform=False):
@@ -497,10 +354,7 @@ def _convert(image, dtype, force_copy=False, uniform=False):
 
     image = np.asarray(image)
     dtypeobj_in = image.dtype
-    if dtype is np.floating:
-        dtypeobj_out = np.dtype("float64")
-    else:
-        dtypeobj_out = np.dtype(dtype)
+    dtypeobj_out = np.dtype("float64") if dtype is np.floating else np.dtype(dtype)
     dtype_in = dtypeobj_in.type
     dtype_out = dtypeobj_out.type
     kind_in = dtypeobj_in.kind
@@ -526,8 +380,8 @@ def _convert(image, dtype, force_copy=False, uniform=False):
         imin_in = np.iinfo(dtype_in).min
         imax_in = np.iinfo(dtype_in).max
     if kind_out in "ui":
-        imin_out = np.iinfo(dtype_out).min
-        imax_out = np.iinfo(dtype_out).max
+        imin_out = np.iinfo(dtype_out).min  # type: ignore
+        imax_out = np.iinfo(dtype_out).max  # type: ignore
 
     # any -> binary
     if kind_out == "b":
@@ -556,23 +410,23 @@ def _convert(image, dtype, force_copy=False, uniform=False):
 
         if not uniform:
             if kind_out == "u":
-                image_out = np.multiply(image, imax_out, dtype=computation_type)
+                image_out = np.multiply(image, imax_out, dtype=computation_type)  # type: ignore
             else:
                 image_out = np.multiply(
-                    image, (imax_out - imin_out) / 2, dtype=computation_type
+                    image, (imax_out - imin_out) / 2, dtype=computation_type  # type: ignore
                 )
                 image_out -= 1.0 / 2.0
             np.rint(image_out, out=image_out)
-            np.clip(image_out, imin_out, imax_out, out=image_out)
+            np.clip(image_out, imin_out, imax_out, out=image_out)  # type: ignore
         elif kind_out == "u":
-            image_out = np.multiply(image, imax_out + 1, dtype=computation_type)
-            np.clip(image_out, 0, imax_out, out=image_out)
+            image_out = np.multiply(image, imax_out + 1, dtype=computation_type)  # type: ignore
+            np.clip(image_out, 0, imax_out, out=image_out)  # type: ignore
         else:
             image_out = np.multiply(
-                image, (imax_out - imin_out + 1.0) / 2.0, dtype=computation_type
+                image, (imax_out - imin_out + 1.0) / 2.0, dtype=computation_type  # type: ignore
             )
             np.floor(image_out, out=image_out)
-            np.clip(image_out, imin_out, imax_out, out=image_out)
+            np.clip(image_out, imin_out, imax_out, out=image_out)  # type: ignore
         return image_out.astype(dtype_out)
 
     # signed/unsigned int -> float
@@ -585,13 +439,13 @@ def _convert(image, dtype, force_copy=False, uniform=False):
         if kind_in == "u":
             # using np.divide or np.multiply doesn't copy the data
             # until the computation time
-            image = np.multiply(image, 1.0 / imax_in, dtype=computation_type)
+            image = np.multiply(image, 1.0 / imax_in, dtype=computation_type)  # type: ignore
             # DirectX uses this conversion also for signed ints
             # if imin_in:
             #     np.maximum(image, -1.0, out=image)
         else:
             image = np.add(image, 0.5, dtype=computation_type)
-            image *= 2 / (imax_in - imin_in)
+            image *= 2 / (imax_in - imin_in)  # type: ignore
 
         return np.asarray(image, dtype_out)
 
@@ -617,9 +471,9 @@ def _convert(image, dtype, force_copy=False, uniform=False):
         return _scale(image, 8 * itemsize_in - 1, 8 * itemsize_out - 1)
 
     image = image.astype(_dtype_bits("i", itemsize_out * 8))
-    image -= imin_in
+    image -= imin_in  # type: ignore
     image = _scale(image, 8 * itemsize_in, 8 * itemsize_out, copy=False)
-    image += imin_out
+    image += imin_out  # type: ignore
     return image.astype(dtype_out)
 
 
@@ -636,7 +490,7 @@ def video_is_playable(video_filepath: str) -> bool:
         .ogg -> theora
     """
     try:
-        container = pathlib.Path(video_filepath).suffix.lower()
+        container = Path(video_filepath).suffix.lower()
         probe = FFprobe(
             global_options="-show_format -show_streams -select_streams v -print_format json",
             inputs={video_filepath: None},
@@ -657,8 +511,8 @@ def video_is_playable(video_filepath: str) -> bool:
 def convert_video_to_playable_mp4(video_path: str) -> str:
     """Convert the video to mp4. If something goes wrong return the original video."""
     try:
-        output_path = pathlib.Path(video_path).with_suffix(".mp4")
         with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            output_path = Path(video_path).with_suffix(".mp4")
             shutil.copy2(video_path, tmp_file.name)
             # ffmpeg will automatically use h264 codec (playable in browser) when converting to mp4
             ff = FFmpeg(
@@ -670,4 +524,7 @@ def convert_video_to_playable_mp4(video_path: str) -> str:
     except FFRuntimeError as e:
         print(f"Error converting video to browser-playable format {str(e)}")
         output_path = video_path
+    finally:
+        # Remove temp file
+        os.remove(tmp_file.name)  # type: ignore
     return str(output_path)
